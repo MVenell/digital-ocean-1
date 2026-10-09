@@ -68,6 +68,56 @@ every important operation.
 
 ------------------------------------------------------------------------
 
+## Frozen Application Model
+
+Use a simple **e-commerce/product-catalog API** as the reference
+application. A product should have fields similar to `id`, `name`,
+`description`, `category_id`, `price`, `inventory`, `created_at`, and
+`updated_at`.
+
+The main operations are:
+
+-   Get product by ID.
+-   List products by `category_id` with pagination and a stable sort.
+-   Create product.
+-   Update price and/or inventory.
+
+Use normal production-style indexes required by these operations. Avoid
+deliberately pathological SQL, full-text search, or large multi-table
+joins. The goal is infrastructure capacity, not a query-optimization
+contest.
+
+If authenticated endpoints are used, generate/reuse test JWTs rather
+than performing password hashing/login on every load-test iteration.
+
+## Latency and Error Definition
+
+Use **k6 end-to-end HTTP request duration** for the primary latency
+measurement.
+
+Initial SLO:
+
+``` text
+p95 request duration < 200 ms
+error rate < 0.1%
+```
+
+Count timeouts, connection failures, failed required k6 checks, and
+unexpected non-2xx responses as errors. Record p50, p95, and p99, but
+use p95 plus the error threshold to decide whether a configuration
+passes.
+
+## Database State Between Runs
+
+Create/update traffic mutates the database. Every **confirmation run
+used as a published result** must start from the same deterministic
+seeded database state.
+
+Exploratory capacity-search stages may run without a complete restore
+between every short step, but their results are not the final comparison
+numbers. Automate database reset/restore and record the dataset
+seed/version with each result.
+
 ## Target Architecture
 
 Initial architecture:
@@ -112,95 +162,67 @@ when measurements justify them.
 
 ------------------------------------------------------------------------
 
-## Benchmark Stages
+## Benchmark Scope: Free-Only Round
 
-### Stage 1 - Single Server Baseline
+This plan covers **only the zero-cost preparation and local validation
+round**.
 
-Start with:
+Do not provision any DigitalOcean resource and do not run any cloud
+benchmark in this round.
 
-``` text
-k6 -> Rust/Axum -> PostgreSQL
-```
+The purpose of this round is to prove that the benchmark harness is
+correct before any money can be spent.
 
-No load balancer.
+### Allowed tests
 
-No Redis.
-
-Prefer keeping the API and PostgreSQL separate if budget allows so
-resource usage and bottlenecks are easier to interpret.
-
-Purpose:
-
--   establish baseline throughput;
--   establish DB behavior;
--   verify the load-testing methodology;
--   identify whether the API or database becomes the first bottleneck.
-
-------------------------------------------------------------------------
-
-### Stage 2 - Horizontal API Scaling
-
-Test:
+Run only on hardware/environments already available locally at no
+incremental cost:
 
 ``` text
-              +-> Rust API #1 --+
-k6 -> LB -----+                 +-> PostgreSQL
-              +-> Rust API #2 --+
+local k6 -> local Rust/Axum -> local PostgreSQL
+                               |
+                               +-> local Redis when testing cache behavior
 ```
 
-Purpose:
+Allowed work:
 
--   determine whether adding an application server meaningfully
-    increases capacity;
--   determine whether PostgreSQL becomes the bottleneck;
--   measure the cost/capacity effect of horizontal scaling;
--   demonstrate the role of a load balancer.
+1.  Build the Rust application in release mode.
+2.  Run PostgreSQL locally.
+3.  Seed the deterministic dataset.
+4.  Verify all benchmark endpoints.
+5.  Build and validate `workload-v1`.
+6.  Run short smoke tests at low load.
+7.  Verify k6 checks, latency metrics, error accounting, and hard stop
+    conditions.
+8.  Verify deterministic database reset/restore.
+9.  Verify Redis behavior and cache hit/miss measurement locally.
+10. Verify result collection and summary generation.
+11. Prepare Terraform/OpenTofu configuration, but run **plan/validation
+    only**. Never apply it.
+12. Prepare DigitalOcean pricing/configuration files without creating
+    resources.
+13. Prepare teardown scripts/configuration for the later paid round, but
+    do not need to execute them against cloud resources.
 
-------------------------------------------------------------------------
+### Explicitly forbidden in this round
 
-### Stage 3 - Add Redis
+-   `terraform apply` against DigitalOcean.
+-   Creating a Droplet.
+-   Creating a DigitalOcean load balancer.
+-   Creating a managed database.
+-   Creating Spaces, volumes, snapshots, reserved IPs, or other billable
+    resources.
+-   Running a cloud-based k6 load generator.
+-   Running high-throughput tests intended to find production capacity.
+-   Any test whose purpose is to establish DigitalOcean RPS capacity.
+-   Any action that may create a DigitalOcean charge.
 
-Test:
+If an action may incur a charge or its cost cannot be established as
+zero, **stop and ask for a future plan update instead of performing
+it**.
 
-``` text
-              +-> Rust API #1 --+
-k6 -> LB -----+                 +-> Redis -> PostgreSQL
-              +-> Rust API #2 --+
-```
-
-Cache only operations where caching would be realistic.
-
-Purpose:
-
--   measure reduction in database reads;
--   measure throughput improvement;
--   measure latency improvement;
--   determine whether Redis is economically justified.
-
-Do not make every request a cache hit.
-
-Record cache hit/miss rates.
-
-------------------------------------------------------------------------
-
-### Stage 4 - Scale the Database
-
-Only do this if PostgreSQL is demonstrably the limiting resource.
-
-Possible experiments:
-
--   larger PostgreSQL Droplet;
--   PostgreSQL tuning;
--   connection pooling;
--   read replica if the workload and implementation justify it.
-
-Do not add database complexity merely to make the architecture look
-sophisticated.
-
-The benchmark should show **why** each system-design component becomes
-necessary.
-
-------------------------------------------------------------------------
+The paid/capacity-testing phases will be added to this document only
+when explicitly requested later.
 
 ## Reference Dataset
 
@@ -277,59 +299,33 @@ known number of requests per second.
 
 ------------------------------------------------------------------------
 
-## Ramp Strategy
+## Local Smoke-Test Strategy
 
-Do not immediately run long tests.
+This round is not a capacity benchmark.
 
-First perform a short capacity search.
+Use only enough local traffic to prove that the workload generator and
+measurements behave correctly.
 
-Example progression:
-
-``` text
-100 RPS
-250 RPS
-500 RPS
-1,000 RPS
-2,000 RPS
-4,000 RPS
-...
-```
-
-Initial exploratory stages can run for approximately 30-60 seconds each.
-
-Stop increasing traffic when the system clearly fails the defined SLO.
-
-Once the approximate limit is known, test around that boundary more
-precisely.
-
-Example:
-
-If:
+Suggested approach:
 
 ``` text
-2,000 RPS = healthy
-4,000 RPS = unhealthy
+very low RPS -> short run -> verify expected operations and metrics -> stop
 ```
 
-test:
+Keep test duration short and choose conservative local RPS values. Do
+not search for the maximum throughput of the local machine because that
+result is not part of the DigitalOcean comparison.
 
-``` text
-2,500
-3,000
-3,500
-```
+Verify that:
 
-Then run a longer confirmation test near the highest healthy level.
-
-Suggested confirmation duration:
-
-``` text
-5-10 minutes
-```
-
-The exact duration should be configurable.
-
-------------------------------------------------------------------------
+-   operation proportions approximately match `workload-v1`;
+-   k6 records p50/p95/p99;
+-   timeouts and failed checks count as errors;
+-   the SLO logic reports pass/fail correctly;
+-   maximum RPS and maximum duration caps work;
+-   the test terminates cleanly;
+-   database reset produces the same initial state;
+-   Redis hit/miss metrics are captured when Redis is enabled.
 
 ## Performance Definition
 
@@ -415,135 +411,60 @@ from:
 
 ------------------------------------------------------------------------
 
-## Cost Tracking
+## Cost / Cloud Guardrail
 
-Every infrastructure configuration needs an associated monthly cost.
-
-Create a machine-readable configuration/result record containing at
-least:
+The required experiment spend for this round is:
 
 ``` text
-configuration name
-Droplet types
-number of Droplets
-load balancer
-Redis cost
-database cost
-storage cost
-backup cost
-other required infrastructure
-estimated monthly total
+$0.00
 ```
 
-Do not hard-code current DigitalOcean prices deep inside benchmark
-logic.
+There is no `$5` approval threshold in this version because **no paid
+test is authorized at all**.
 
-Keep pricing in a separate configuration/data file so it can be updated
-later.
+DigitalOcean infrastructure may be modeled in Terraform/OpenTofu and
+pricing files, but it must not be created.
 
-Example:
+Rules:
 
-``` text
-pricing/
-  digitalocean.yaml
-```
+-   Do not call any command that creates, modifies, reserves, or retains
+    a billable DigitalOcean resource.
+-   `terraform validate`, formatting, static checks, and a plan that is
+    guaranteed not to create resources are allowed.
+-   Never run `terraform apply`.
+-   `doctl` may be used only for non-mutating inspection if needed; do
+    not use it to create resources.
+-   Do not rely on DigitalOcean free credits, promotions, or assumptions
+    about billing granularity to classify a test as free.
+-   If there is uncertainty about whether an action can cost money,
+    treat it as paid and do not perform it.
+-   Do not perform even a short cloud benchmark in this round.
+-   Do not provision a cloud load generator.
+-   Do not test the maximum capacity of DigitalOcean infrastructure.
 
-The benchmark's technical result should remain valid even if
-DigitalOcean changes its prices.
+A later version of this plan can explicitly authorize paid DigitalOcean
+capacity testing with a spending threshold and provisioning workflow.
 
-------------------------------------------------------------------------
+## Results Required From This Round
 
-## Result Format
+The free-only round is successful when it produces:
 
-Every completed configuration should produce a summary similar to:
+-   a working Rust/Axum application;
+-   deterministic PostgreSQL seed/reset tooling;
+-   working local Redis integration;
+-   frozen `workload-v1`;
+-   working k6 scripts;
+-   verified SLO/error calculations;
+-   verified safety caps for duration and RPS;
+-   repeatable local smoke-test results;
+-   infrastructure-as-code that can be reviewed for a future
+    DigitalOcean round;
+-   pricing/configuration structure ready for future cost data;
+-   documentation explaining exactly how the later cloud benchmark will
+    be launched once authorized.
 
-``` text
-Configuration: 2x API + LB + PostgreSQL + Redis
-
-Monthly infrastructure cost: $X
-
-Maximum healthy sustained load:
-3,200 requests/sec
-
-SLO:
-p95 < 200 ms
-errors < 0.1%
-
-Measured:
-p50: 42 ms
-p95: 171 ms
-p99: 260 ms
-errors: 0.04%
-
-API CPU: ...
-PostgreSQL CPU: ...
-Redis CPU: ...
-
-Likely bottleneck:
-PostgreSQL CPU / disk / API CPU / network / etc.
-```
-
-Also store the raw k6 output/results where practical.
-
-------------------------------------------------------------------------
-
-## Final Comparison Table
-
-The repository should make it easy to produce something like:
-
-  ----------------------------------------------------------------------------
-  Architecture       Monthly cost Max healthy RPS Cost per 1k RPS Bottleneck
-  --------------- --------------- --------------- --------------- ------------
-  1 API +                     \$X               X             \$X ...
-  PostgreSQL                                                      
-
-  2 API + LB +                \$X               X             \$X ...
-  PostgreSQL                                                      
-
-  2 API + LB +                \$X               X             \$X ...
-  Redis +                                                         
-  PostgreSQL                                                      
-
-  Larger DB                   \$X               X             \$X ...
-  configuration                                                   
-  ----------------------------------------------------------------------------
-
-The most important outputs are:
-
-``` text
-monthly infrastructure cost
-vs.
-measured sustainable workload
-```
-
-------------------------------------------------------------------------
-
-## Safety / Cost Controls
-
-This benchmark must be designed to avoid accidental cloud bills.
-
-### Hard rules
-
--   Do not enable autoscaling.
--   Do not provision large infrastructure automatically without explicit
-    confirmation.
--   Keep benchmark infrastructure clearly tagged/labeled.
--   Provide a teardown command/script.
--   Avoid unnecessary managed resources.
--   Use short exploratory load tests.
--   Put an explicit maximum RPS in the load-test configuration.
--   Put an explicit maximum duration in the load-test configuration.
--   Never create an unbounded k6 test.
--   Do not create resources repeatedly if existing benchmark resources
-    can be reused safely.
--   Document which resources continue billing when tests stop.
-
-Prefer an infrastructure workflow that makes it easy to see exactly what
-will be created before creation.
-
-If Terraform/OpenTofu is used, inspect the plan before applying it.
-
-------------------------------------------------------------------------
+Do not claim any DigitalOcean throughput, capacity, or cost-performance
+result from this round.
 
 ## Reproducibility
 
@@ -645,108 +566,97 @@ Compile the Rust service in release mode.
 
 ------------------------------------------------------------------------
 
+## Comparison Freeze
+
+Once `workload-v1`, the seed dataset, application behavior, indexes,
+SLOs, and benchmark methodology are frozen, do not silently modify them
+between configurations.
+
+> Optimize the experiment for reproducibility and comparability, not
+> maximum benchmark numbers. The workload must remain fixed while
+> infrastructure changes. Every published configuration must begin from
+> the same database state. Components such as Redis, additional API
+> servers, and larger database servers should only be introduced in
+> response to a measured bottleneck. Never silently change application
+> behavior, workload distribution, dataset, indexes, SLOs, or benchmark
+> methodology between configurations.
+
+If any frozen element must change, create a new explicitly versioned
+experiment and rerun the configurations that will be compared.
+
 ## Expected Implementation Sequence
 
-### Phase 1 - Local benchmark
+### Phase 1 - Build locally
 
-Before spending money:
+1.  Get the Rust project running locally in release mode.
+2.  Run PostgreSQL locally.
+3.  Implement/verify the product-catalog endpoints.
+4.  Seed the deterministic dataset.
+5.  Implement deterministic reset/restore.
+6.  Add Redis integration without changing the external workload.
+7.  Verify application tests.
 
-1.  Get the Rust project running locally.
-2.  Get PostgreSQL running.
-3.  Seed the deterministic dataset.
-4.  Implement/verify benchmark endpoints.
-5.  Create the k6 mixed workload.
-6.  Verify metrics and thresholds.
-7.  Verify that the load test stops correctly.
-8.  Verify result collection.
-9.  Test Redis locally.
-10. Document the exact workload.
+### Phase 2 - Build the benchmark harness
 
-No DigitalOcean resources should be necessary to validate the basic
-benchmark harness.
+1.  Implement frozen `workload-v1`.
+2.  Add required k6 checks.
+3.  Add p50/p95/p99 and error reporting.
+4.  Add explicit maximum RPS and maximum duration caps.
+5.  Run only short, low-load local smoke tests.
+6.  Verify workload proportions and result output.
+7.  Verify failure/error accounting.
+8.  Verify database reset between official local validation runs.
+9.  Verify Redis hit/miss reporting.
 
-------------------------------------------------------------------------
+### Phase 3 - Prepare, but do not provision, DigitalOcean infrastructure
 
-### Phase 2 - DigitalOcean baseline
+1.  Create Terraform/OpenTofu definitions for the future baseline
+    architecture.
+2.  Run formatting and validation.
+3.  Review the resource graph/configuration.
+4.  Prepare cloud-init/configuration scripts.
+5.  Prepare DigitalOcean pricing data structure.
+6.  Prepare future benchmark and teardown scripts.
+7.  Document the future provisioning sequence.
 
-Provision the smallest useful baseline.
+**Do not run `terraform apply`.**
 
-Run:
+### Phase 4 - Stop
 
-1.  smoke test;
-2.  low-load validation;
-3.  exploratory ramp;
-4.  boundary search;
-5.  confirmation test.
+At this point, stop the project.
 
-Record results and cost.
+Do not proceed into DigitalOcean capacity testing.
 
-------------------------------------------------------------------------
-
-### Phase 3 - Scale based on evidence
-
-Inspect the baseline bottleneck.
-
-Only then choose the next architecture.
-
-Examples:
-
-``` text
-API CPU saturated
--> add/resize API capacity
-
-PostgreSQL saturated
--> improve/resize database
-
-read-heavy DB workload
--> test Redis
-
-single API capacity reached
--> add second API + load balancer
-```
-
-The architecture should evolve because of measured bottlenecks, not
-because the final diagram was decided in advance.
-
-------------------------------------------------------------------------
-
-### Phase 4 - Produce comparison data
-
-For each tested configuration:
-
-1.  save raw results;
-2.  save infrastructure specification;
-3.  save monthly cost;
-4.  save sustainable RPS;
-5.  save latency/error statistics;
-6.  identify likely bottleneck;
-7.  document any tuning performed.
-
-Generate a final CSV/JSON/Markdown summary that can later be used for
-charts and cost comparisons.
-
-------------------------------------------------------------------------
+Wait for explicit authorization to revise this plan with a paid-testing
+phase.
 
 ## Definition of Done
 
-The DigitalOcean experiment is complete when we can make a statement of
-this form with measured evidence:
+This free-only round is complete when we can demonstrate locally that:
 
-> On configuration X, costing approximately \$Y/month at the recorded
-> DigitalOcean prices, the Rust/PostgreSQL application sustained Z
-> requests/second while maintaining p95 latency below 200 ms and errors
-> below 0.1%.
+> The Rust/PostgreSQL/Redis benchmark application, deterministic
+> dataset, fixed workload, k6 measurements, error/SLO logic, result
+> collection, and infrastructure definitions are ready for a future
+> DigitalOcean capacity benchmark without having created any billable
+> cloud resources.
 
-Ideally we will have several configurations so we can plot:
+Required conditions:
 
-``` text
-DigitalOcean monthly cost
-        vs.
-sustainable application throughput
-```
+-   Actual authorized cloud experiment spend: **\$0.00**.
+-   No DigitalOcean benchmark infrastructure has been provisioned.
+-   No DigitalOcean capacity/RPS claim has been made.
+-   `workload-v1` is frozen.
+-   Database reset is deterministic.
+-   Local smoke tests pass.
+-   k6 safety limits have been verified.
+-   Future DigitalOcean infrastructure can be reviewed as code.
+-   The next phase requires an explicit update to this plan before any
+    paid resource can be created.
 
-The purpose is **not** to prove DigitalOcean is cheap or expensive.
+The purpose of this round is **benchmark preparation and validation
+only**.
 
-The purpose is to measure the self-managed infrastructure cost curve
-honestly enough that it can later be compared against managed-service
-pricing.
+Do not attempt to answer yet whether DigitalOcean is cheaper, how much
+traffic it can handle, or where the managed-vs-self-managed crossover
+occurs. Those questions belong to the next explicitly authorized testing
+round.
